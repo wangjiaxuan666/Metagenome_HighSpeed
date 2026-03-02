@@ -1,0 +1,1 @@
+rm -rf logs 1.Clean_Data 2.Quantity fq.meta 3.Annotation retry.fq.meta

@@ -1,0 +1,23 @@
+# 1. 忽略所有原始数据和测试数据目录
+Rawdata/
+Rawdata_test/
+
+# 2. 忽略分析产生的中间结果和最终结果目录
+1.Clean_Data/
+2.Quantity/
+3.Annotation/
+
+# 3. 忽略运行日志和临时文件
+logs/
+*.log
+*.done
+*.all_done
+parallel_runtime.joblog
+
+# 4. 忽略 Python 缓存文件
+__pycache__/
+*.py[cod]
+
+# 5. 忽略系统临时文件
+.DS_Store
+.ipynb_checkpoints/
