@@ -34,13 +34,6 @@ ARG_DIR="3.Annotation/ARG"
 LOG_DIR="logs"
 mkdir -p $CLEAN_DIR $QUANT_DIR $ARG_DIR $LOG_DIR
 
-# 定义内存盘路径（每个样本独立文件夹）
-SHM_DIR="/dev/shm/hmn_${SAMPLE}"
-mkdir -p "$SHM_DIR"
-# 确保脚本退出（无论成功失败）都会清理内存盘
-trap 'rm -rf "$SHM_DIR" ; exit 1' SIGINT SIGTERM ERR
-
-
 LOG_FILE="$LOG_DIR/${SAMPLE}.process.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
@@ -61,15 +54,10 @@ function timestamp_end() {
 
 function check_disk_safety() {
     FREE_MB=$(df -m /data | tail -1 | awk '{print $4}')
-    # 使用 if 语句代替 && 简写，这样即便条件不成立，也不会触发 trap ERR
-    if [[ "$FREE_MB" -lt 153600 ]]; then
-        echo "Disk space low ($FREE_MB MB), waiting 10m..."
-        sleep 600
-    fi
-    return 0 # 强制返回成功状态，确保不会误杀脚本
+    [[ "$FREE_MB" -lt 153600 ]] && { echo "Disk space low, waiting 10m..."; sleep 600; }
 }
 
-# ---------- 执行流程 ----------
+# ---------- 3. 执行流程 ----------
 
 echo "======= [$(date)] Processing: $SAMPLE ======="
 
@@ -83,8 +71,6 @@ if [[ "$RUN_STEP1_CENT" == "true" ]] && [[ ! -f "$LOG_DIR/${SAMPLE}.s1.done" ]];
         timestamp_end
     fi
 fi
-
-echo "yes"
 
 # --- Step 2: fastp (质控 - 仅保留 JSON) ---
 if [[ "$RUN_STEP2_FASTP" == "true" ]] && [[ ! -f "$LOG_DIR/${SAMPLE}.s2.done" ]]; then
@@ -106,21 +92,13 @@ if [[ "$RUN_STEP2_FASTP" == "true" ]] && [[ ! -f "$LOG_DIR/${SAMPLE}.s2.done" ]]
 
     if [[ -f "$OUT_FQ" ]]; then
         rm -f "$IN1" "$IN2"
-        # 【新增】将核心文件同步到内存，后续流程读这个文件
-        cp "$OUT_FQ" "$SHM_DIR/${SAMPLE}.clean.fastq"
         touch "$LOG_DIR/${SAMPLE}.s2.done"
         timestamp_end
     fi
 fi
 
-# 修改后续流程的输入文件：如果内存里有就读内存，没有读硬盘
-if [[ -f "$SHM_DIR/${SAMPLE}.clean.fastq" ]]; then
-    CLEAN_FQ="$SHM_DIR/${SAMPLE}.clean.fastq"
-else
-    CLEAN_FQ="${CLEAN_DIR}/${SAMPLE}.clean.fastq"
-fi
-
-CLEAN_FQ_true="${CLEAN_DIR}/${SAMPLE}.clean.fastq"
+# 后续流程的输入文件
+CLEAN_FQ="${CLEAN_DIR}/${SAMPLE}.clean.fastq"
 
 # --- Step 3: MetaPhlAn 4 (带失败自动清理) ---
 if [[ "$RUN_STEP3_MPA" == "true" ]] && [[ ! -f "$LOG_DIR/${SAMPLE}.s3.done" ]]; then
@@ -158,36 +136,33 @@ if [[ "$RUN_STEP35_STRAIN" == "true" ]] && [[ ! -f "$LOG_DIR/${SAMPLE}.s3_5.done
     fi
 fi
 
-# --- Step 4: HUMAnN (内存映射提速版) ---
+# --- Step 4: HUMAnN (针对随机后缀优化的清理版) ---
 if [[ "$RUN_STEP4_HUMANN" == "true" ]] && [[ ! -f "$LOG_DIR/${SAMPLE}.s4.done" ]]; then
     timestamp_start "HUMAnN"
     
-    # 1. 在内存盘创建工作空间
-    SHM_WORK_DIR="/dev/shm/hmn_${SAMPLE}"
-    mkdir -p "$SHM_WORK_DIR"
+    # 1. 设置清理陷阱 (Trap)
+    # 只要任务异常退出，立即删除该样本名下所有的 humann_temp 文件夹
+    # 使用 ${SAMPLE}_humann_temp* 匹配随机后缀
+    trap 'echo "[CLEANUP] Interrupted! Wiping temp files..."; rm -rf "${QUANT_DIR}/${SAMPLE}_humann_temp"* ; exit 1' SIGINT SIGTERM ERR
 
-    # 2. 捕捉中断信号，确保内存盘被清理
-    trap 'echo "Cleaning SHM..."; rm -rf "$SHM_WORK_DIR"; exit 1' SIGINT SIGTERM ERR
-
-    # 3. 执行 HUMAnN：注意 -o 指向的是内存盘
-    # 我们把 CLEAN_FQ 也从内存读（如果 Step 2 已经考进去了话）
+    # 2. 执行 HUMAnN
+    # --o-log: 记录日志，方便以后排查为什么跑得慢
     humann --threads "$THREADS" \
            --input "$CLEAN_FQ" \
-           --output "$SHM_WORK_DIR" \
+           --output "$QUANT_DIR" \
            --output-basename "$SAMPLE" \
            --taxonomic-profile "${QUANT_DIR}/${SAMPLE}_profile.txt" \
            --remove-temp-output
-    cp ${SHM_WORK_DIR}/${SAMPLE}_*.[tl]* "$QUANT_DIR/"
 
-    # 4. 成功后，将结果从内存考回硬盘，并销毁内存占位
+    # 3. 结果验证与强制清理
+    # 注意：检查标准输出文件名是否为 ${SAMPLE}_genefamilies.tsv
     if [[ -f "${QUANT_DIR}/${SAMPLE}_2_genefamilies.tsv" ]]; then
-        rm -rf "$SHM_WORK_DIR"
-        trap - SIGINT SIGTERM ERR
+        trap - SIGINT SIGTERM ERR  # 成功后解除陷阱
         touch "$LOG_DIR/${SAMPLE}.s4.done"
         timestamp_end
     else
-        echo "[ERROR] HUMAnN failed in RAM. Check logs."
-        rm -rf "$SHM_WORK_DIR"
+        echo "[ERROR] HUMAnN failed for $SAMPLE. Cleaning up..."
+        rm -rf "${QUANT_DIR}/${SAMPLE}_humann_temp"*
         exit 1
     fi
 fi
@@ -196,7 +171,7 @@ fi
 if [[ "$RUN_STEP5_ARGS" == "true" ]] && [[ ! -f "$LOG_DIR/${SAMPLE}.s5.done" ]]; then
     timestamp_start "ARGs_OAP"
     W_DIR="${ARG_DIR}/${SAMPLE}" ; mkdir -p "${W_DIR}/work_space"
-    ln -sf $(readlink -f "$CLEAN_FQ_true") "${W_DIR}/work_space/sample.fastq"
+    ln -sf $(readlink -f "$CLEAN_FQ") "${W_DIR}/work_space/sample.fastq"
     
     PUSH_DIR=$(pwd)
     cd "${W_DIR}/work_space" || exit
@@ -233,9 +208,9 @@ if [[ "$RUN_CLEANUP" == "true" ]]; then
         
         # 2. 压缩 Fastq 结果 (增加判断，防止重复压缩)
         # 只有在 .fastq 存在且 .fastq.gz 不存在时才执行压缩
-        if [[ -f "$CLEAN_FQ_true" ]] && [[ ! -f "${CLEAN_FQ_true}.gz" ]]; then
-            echo "Compressing $CLEAN_FQ_true with pigz..."
-            pigz -p 8 "$CLEAN_FQ_true"
+        if [[ -f "$CLEAN_FQ" ]] && [[ ! -f "${CLEAN_FQ}.gz" ]]; then
+            echo "Compressing $CLEAN_FQ with pigz..."
+            pigz -p 8 "$CLEAN_FQ"
         fi
         
         # 3. 生成一个最终的“大功告成”标记（可选，方便统计）

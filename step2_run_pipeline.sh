@@ -4,7 +4,7 @@
 # ==============================================================================
 
 META_FILE="fq.meta"
-MAX_JOBS=6            # 64核服务器+机械硬盘，建议并发 4-6，防止 IO 阻塞
+MAX_JOBS=8            # 64核服务器+机械硬盘，建议并发 4-6，防止 IO 阻塞
 THREADS_PER_JOB=10    # 每个样本分配 10 线程 (6*10=60核)
 JOBLOG="logs/parallel_runtime.joblog" # 核心：记录成败，支持断点续跑
 
@@ -34,3 +34,9 @@ SUCCESS_COUNT=$(ls logs/*.all_done 2>/dev/null | wc -l)
 echo "[$(date)] 批次处理结束。"
 echo "成功样本数: $SUCCESS_COUNT"
 echo "详情请查阅: $JOBLOG"
+
+bash -x single_sample_process.sh \
+KB100 \
+/data/wangjiaxuan/workflow/Metagenome_HighSpeed/Rawdata_test/KB100.raw.R1.fq.gz \
+/data/wangjiaxuan/workflow/Metagenome_HighSpeed/Rawdata_test/KB100.raw.R2.fq.gz \
+10
