@@ -23,7 +23,6 @@ cat "$META_FILE" | /data/wangjiaxuan/miniconda3/envs/meta/bin/parallel \
     -j "$MAX_JOBS" \
     --colsep '\t' \
     --joblog "$JOBLOG" \
-    --resume \
     --progress \
     "bash single_sample_process.sh {1} {2} {3} $THREADS_PER_JOB"
 

@@ -27,7 +27,6 @@ CONDA_BASE=$(conda info --base)
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate meta
 export PYTHONWARNINGS="ignore"
-set -o pipefail  # <-- 加入这一行！极其重要！
 
 CENT_BIN="/data/wangjiaxuan/miniconda3/envs/meta/bin/centrifuger"
 CENT_DB="/data/wangjiaxuan/refer/centrifuger_db/CHM13/chm13_index"
@@ -84,137 +83,53 @@ function check_disk_safety() {
 }
 
 # ---------- 执行流程 ----------
+
+# 执行流程开头的提示
 echo "======= [$(get_time)] Processing: $SAMPLE ======="
 
-if [[ -f "$LOG_DIR/${SAMPLE}.all_done" ]]; then
-    echo "[INFO] Sample $SAMPLE is already marked as DONE. Skipping entirely."
-    exit 0
-fi
-
-# ==============================================================================
-# --- Step 1: 粗筛 (fastp 初始质控 + Centrifuger 极速去宿主) ---
-# ==============================================================================
-QC_IN1="${CLEAN_DIR}/${SAMPLE}.qc_1.fq.gz"
-QC_IN2="${CLEAN_DIR}/${SAMPLE}.qc_2.fq.gz"
-
-# 【修复】：Centrifuger 默认输出的是 .fq.gz 格式
-CENT_UN_PREFIX="${CLEAN_DIR}/${SAMPLE}_cent_unmapped"
-CENT_UN1="${CENT_UN_PREFIX}_1.fq.gz"
-CENT_UN2="${CENT_UN_PREFIX}_2.fq.gz"
-JSON_RAW="${LOG_DIR}/${SAMPLE}.fastp_raw.json"
-
+# --- Step 1: Centrifuger (去宿主) ---
+# 注意：Centrifuger 出来的文件是 .fq.gz 格式
 if [[ "$RUN_STEP1_CENT" == "true" ]] && [[ ! -f "$LOG_DIR/${SAMPLE}.s1.done" ]]; then
     check_disk_safety
-    timestamp_start "Step1_Coarse_Filter (fastp + Centrifuger)"
-
-    # 1.1 初始质控：切除低质量尾巴
-    fastp -i "$R1" -I "$R2" \
-          -o "$QC_IN1" -O "$QC_IN2" \
-          -q 20 -u 30 -l 50 \
-          -w 8 \
-          -j "$JSON_RAW" -h /dev/null
-
-    if [[ ! -f "$QC_IN1" ]]; then
-        echo "[ERROR] Step 1.1 fastp failed."
-        exit 1
-    fi
-
-    # 1.2 极速粗筛宿主 (Centrifuger) 
-    # 【修复】：恢复使用你原本正确的 --un 参数！
-    if $CENT_BIN -x $CENT_DB -1 "$QC_IN1" -2 "$QC_IN2" -t "$THREADS" --min-hitlen 25 \
-        --un "$CENT_UN_PREFIX" > /dev/null; then
-        
-        rm -f "$QC_IN1" "$QC_IN2" # 阅后即焚，清理原始质控产物
-        
+    timestamp_start "Centrifuger"
+    if $CENT_BIN -x $CENT_DB -1 "$R1" -2 "$R2" -t "$THREADS" --min-hitlen 25 --un "${CLEAN_DIR}/${SAMPLE}_nonhuman" > /dev/null; then
         touch "$LOG_DIR/${SAMPLE}.s1.done"
         timestamp_end
-    else
-        echo "[ERROR] Step 1.2 Centrifuger failed."
-        exit 1
     fi
 fi
 
-# ==============================================================================
-# --- Step 2: 精筛 (Bowtie2 深度去宿主 + 二次 fastp + 极速报表) ---
-# ==============================================================================
-BOWTIE2_DB="/data/wangjiaxuan/refer/kneaddata_db/hg_39"
-BT2_UN1="${CLEAN_DIR}/${SAMPLE}.bt2_clean_1.fq.gz"
-BT2_UN2="${CLEAN_DIR}/${SAMPLE}.bt2_clean_2.fq.gz"
-
-OUT1="${CLEAN_DIR}/${SAMPLE}.clean_1.fastq"
-OUT2="${CLEAN_DIR}/${SAMPLE}.clean_2.fastq"
-JSON_CLN="${LOG_DIR}/${SAMPLE}.fastp_clean.json"
-
+# --- Step 2: fastp (双端输出 + 兼容合并) ---
 if [[ "$RUN_STEP2_FASTP" == "true" ]] && [[ ! -f "$LOG_DIR/${SAMPLE}.s2.done" ]]; then
-    timestamp_start "Step2_Fine_Filter (Bowtie2 + fastp_Report)"
+    timestamp_start "fastp"
+    IN1="${CLEAN_DIR}/${SAMPLE}_nonhuman_1.fq.gz"
+    IN2="${CLEAN_DIR}/${SAMPLE}_nonhuman_2.fq.gz"
+    
+    # 定义双端输出，供 inStrain 使用
+    OUT1="${CLEAN_DIR}/${SAMPLE}.clean_1.fastq"
+    OUT2="${CLEAN_DIR}/${SAMPLE}.clean_2.fastq"
+    
+    # 取消 --merge，保留标准双端输出
+    # 一条 read 修剪后长度不足 50bp，或者它包含过多（>30%）错误率大于 1% 的低质量碱基，就直接把它扔掉。
+    fastp -i "$IN1" -I "$IN2" \
+          -o "$OUT1" -O "$OUT2" \
+          -q 20 -u 30 -l 50 \
+          -w "$THREADS" \
+          -j "${LOG_DIR}/${SAMPLE}.fastp.json" \
+          -h /dev/null
 
-    # 2.1 防呆：如果粗筛后一根毛都不剩
-    if [[ ! -s "$CENT_UN1" ]]; then
-        echo "[WARNING] Centrifuger outputs are completely empty."
-        touch "$OUT1" "$OUT2"
-        echo '{"summary":{"before_filtering":{"total_reads":0,"q30_rate":0,"gc_content":0},"after_filtering":{"total_reads":0,"q30_rate":0,"gc_content":0}}}' > "$JSON_CLN"
-    else
-        ## 2.2 裸调 Bowtie2 精筛 (完美复刻 KneadData 核心参数，并开启内存共享机制)
-        # --very-sensitive: 采用 end-to-end 模式，保护微生物 reads 不被过度误杀
-        # --dovetail: 允许极短插入片段的 R1/R2 穿透重叠，提高短宿主片段检出率
-        # --mm: (极度关键) 开启内存映射，多样本高并发时共享同一个 3.2G 索引，拒绝内存与 I/O 爆炸！
+    if [[ -f "$OUT1" ]] && [[ -f "$OUT2" ]]; then
+        rm -f "$IN1" "$IN2" # 清理去宿主后的临时文件
         
-        bowtie2 -p 8 -x "$BOWTIE2_DB" \
-                -1 "$CENT_UN1" -2 "$CENT_UN2" \
-                --very-sensitive \
-                --dovetail \
-                --mm \
-                --un-conc-gz "${CLEAN_DIR}/${SAMPLE}.bt2_clean_%.fq.gz" \
-                > /dev/null 2> "${LOG_DIR}/${SAMPLE}.bowtie2_host.log"
-                
-        # 2.3 二次过滤并生成终极报告 (解压并标准化供下游使用)
-        # 注意：这里输入的是 Bowtie2 吐出的纯净 .gz 文件
-        fastp -i "${CLEAN_DIR}/${SAMPLE}.bt2_clean_1.fq.gz" -I "${CLEAN_DIR}/${SAMPLE}.bt2_clean_2.fq.gz" \
-              -o "$OUT1" -O "$OUT2" \
-              -w 8 \
-              -j "$JSON_CLN" -h /dev/null
-    fi
-
-    # 2.4 提取统计指标
-    if [[ -f "$JSON_RAW" ]] && [[ -f "$JSON_CLN" ]]; then
-        STATS_RES=$(python -c "
-import json, sys
-try:
-    with open('$JSON_RAW') as f1, open('$JSON_CLN') as f2:
-        j1 = json.load(f1)
-        j2 = json.load(f2)
-        r_reads = j1['summary']['before_filtering']['total_reads']
-        r_q30 = j1['summary']['before_filtering']['q30_rate'] * 100
-        r_gc = j1['summary']['before_filtering']['gc_content'] * 100
-        c_reads = j2['summary']['after_filtering']['total_reads']
-        c_q30 = j2['summary']['after_filtering']['q30_rate'] * 100
-        c_gc = j2['summary']['after_filtering']['gc_content'] * 100
-        print(f'{r_reads}\t{r_q30:.2f}%\t{r_gc:.2f}%\t{c_reads}\t{c_q30:.2f}%\t{c_gc:.2f}%')
-except Exception as e:
-    print('0\t0.00%\t0.00%\t0\t0.00%\t0.00%')
-")
-        
-        # 写入总表
-        REPORT_FILE="$LOG_DIR/QC_Global_Report.tsv"
-        if [[ ! -f "$REPORT_FILE" ]]; then
-            echo -e "SampleID\tRaw_Reads\tRaw_Q30\tRaw_GC\tClean_Reads\tClean_Q30\tClean_GC" > "$REPORT_FILE"
-        fi
-        echo -e "${SAMPLE}\t${STATS_RES}" >> "$REPORT_FILE"
-        
-        # 极致垃圾回收：把中间产生的 Centrifuger、Bowtie2 和 JSON 文件统统删掉！
-        echo "[Cleanup] Removing intermediate Host sequences and JSON files..."
-        rm -f "$CENT_UN1" "$CENT_UN2" "${CLEAN_DIR}/${SAMPLE}.bt2_clean_1.fq.gz" "${CLEAN_DIR}/${SAMPLE}.bt2_clean_2.fq.gz" "$JSON_RAW" "$JSON_CLN"
-        
-        # 2.5 准备下游 MPA/HUMAnN 所需的合并文件
-        echo "[INFO] QC & Host Depletion finished. Preparing merged Fastq for downstream..."
+        # 【关键兼容】：将双端合并为单文件，供 MetaPhlAn / HUMAnN / ARGs-OAP 使用
         CLEAN_FQ_COMBINED="${CLEAN_DIR}/${SAMPLE}.clean.fastq"
         cat "$OUT1" "$OUT2" > "$CLEAN_FQ_COMBINED"
         
+        # 将合并后的文件放入内存盘提速
+        # cp "$CLEAN_FQ_COMBINED" "$SHM_DIR/${SAMPLE}.clean.fastq"
+        # 太占用内存，去掉！
+
         touch "$LOG_DIR/${SAMPLE}.s2.done"
         timestamp_end
-    else
-        echo "[ERROR] Missing JSON files for QC parsing."
-        exit 1
     fi
 fi
 
@@ -228,13 +143,9 @@ if [[ -f "$LOG_DIR/${SAMPLE}.s2.done" ]]; then
 
     [[ "$RUN_STEP3_MPA" == "true" && ! -f "$LOG_DIR/${SAMPLE}.s3.done" ]] && NEED_MERGED="true"
     [[ "$RUN_STEP4_HUMANN" == "true" && ! -f "$LOG_DIR/${SAMPLE}.s4.done" ]] && NEED_MERGED="true"
-    
-    # 【修复】：把 ARGs-OAP 移到 NEED_PAIRED 这里！
-    [[ "$RUN_STEP5_ARGS" == "true" && ! -f "$LOG_DIR/${SAMPLE}.s5.done" ]] && NEED_PAIRED="true"
-    
+    [[ "$RUN_STEP5_ARGS" == "true" && ! -f "$LOG_DIR/${SAMPLE}.s5.done" ]] && NEED_MERGED="true"
     [[ "$RUN_STEP6_INSTRAIN" == "true" && ! -f "$LOG_DIR/${SAMPLE}.s6.done" ]] && NEED_PAIRED="true"
-    [[ "$RUN_STEP7_SGVF" == "true" && ! -f "$LOG_DIR/${SAMPLE}.s7.done" ]] && NEED_PAIRED="true" 
-    
+    [[ "$RUN_STEP7_SGVF" == "true" && ! -f "$LOG_DIR/${SAMPLE}.s7.done" ]] && NEED_PAIRED="true" # <-- 新增这一行
     # 逻辑联动：如果需要合并文件，那必然需要先解压双端文件
     [[ "$NEED_MERGED" == "true" ]] && NEED_PAIRED="true"
 
@@ -376,69 +287,37 @@ if [[ "$RUN_STEP4_HUMANN" == "true" ]] && [[ ! -f "$LOG_DIR/${SAMPLE}.s4.done" ]
     fi
 fi
 
-# ==============================================================================
-# --- Step 4.5: 全局统一降采样 (保护下游所有高算力模块，防内存/时间爆炸) ---
-# 共享受益者: ARGs-OAP, inStrain, SGVFinder2
-# ==============================================================================
-MAP_IN1="${CLEAN_DIR}/${SAMPLE}.clean_1.fastq"
-MAP_IN2="${CLEAN_DIR}/${SAMPLE}.clean_2.fastq"
+# --- Step 5: ARGs-OAP (带强制清理逻辑) ---
+# 在脚本开头添加抽样参数（比如这里设为单端 5M，双端加起来就是 10M reads）
 
-# 设定安全红线：600 万对 (2400万行)。抽样目标：500 万对
-MAX_PAIRS=6000000
-TARGET_PAIRS=5000000
-SEQTK_BIN="/data/wangjiaxuan/miniconda3/bin/seqtk"
-
-if [[ "$RUN_STEP5_ARGS" == "true" || "$RUN_STEP6_INSTRAIN" == "true" || "$RUN_STEP7_SGVF" == "true" ]]; then
-    # 读取行数 (除以4就是 pairs 数量)
-    READ_LINES=$(wc -l < "$MAP_IN1")
-    CUR_PAIRS=$((READ_LINES / 4))
-    
-    if [ "$CUR_PAIRS" -gt "$MAX_PAIRS" ]; then
-        echo "[Pre-Processing] Sample depth is extremely high (${CUR_PAIRS} pairs)."
-        echo "[Pre-Processing] Global subsampling to ${TARGET_PAIRS} pairs for downstream modules..."
-        
-        SUB_R1="${CLEAN_DIR}/${SAMPLE}.sub_1.fastq"
-        SUB_R2="${CLEAN_DIR}/${SAMPLE}.sub_2.fastq"
-        
-        # 只有在还没有生成抽样文件时才执行，支持完美断点续传
-        if [ ! -f "$SUB_R1" ]; then
-            $SEQTK_BIN sample -s 100 "$MAP_IN1" "$TARGET_PAIRS" > "${SUB_R1}.tmp"
-            $SEQTK_BIN sample -s 100 "$MAP_IN2" "$TARGET_PAIRS" > "${SUB_R2}.tmp"
-            mv "${SUB_R1}.tmp" "$SUB_R1"
-            mv "${SUB_R2}.tmp" "$SUB_R2"
-        fi
-        
-        # 【核心枢纽】：更新指针，将后面所有的输入文件替换成抽样后的小文件！
-        MAP_IN1="$SUB_R1"
-        MAP_IN2="$SUB_R2"
-    else
-        echo "[Pre-Processing] Sample depth (${CUR_PAIRS} pairs) is normal. No global subsampling needed."
-    fi
-fi
-
-# --- Step 5: ARGs-OAP (软链接共享抽样版) ---
+# --- Step 5: ARGs-OAP (双端同步抽样 + 目录直接读取版) ---
 if [[ "$RUN_STEP5_ARGS" == "true" ]] && [[ ! -f "$LOG_DIR/${SAMPLE}.s5.done" ]]; then
     timestamp_start "ARGs_OAP"
     W_DIR="${ARG_DIR}/${SAMPLE}" ; mkdir -p "${W_DIR}/work_space"
     
-    echo "[ARGs-OAP] Linking global fastq files to work_space (Zero I/O overhead)..."
-    # 【神来之笔】：直接给刚才准备好的全局输入文件建软链接！
-    # 使用 realpath 获取绝对路径，防止 ARGs-OAP 进出目录找不到文件
-    ln -sf "$(realpath "$MAP_IN1")" "${W_DIR}/work_space/sample_1.fastq"
-    ln -sf "$(realpath "$MAP_IN2")" "${W_DIR}/work_space/sample_2.fastq"
+    # 动态获取 R1 和 R2 的路径 (依赖前面解压/生成的双端文件)
+    FQ1="${CLEAN_DIR}/${SAMPLE}.clean_1.fastq"
+    FQ2="${CLEAN_DIR}/${SAMPLE}.clean_2.fastq"
+    
+    SEQTK_BIN="/data/wangjiaxuan/miniconda3/bin/seqtk" 
+
+    echo "[ARGs-OAP] Subsampling to max 5000000 reads per end using seqtk..."
+    
+    # 直接使用固定值 5000000 抽样
+    $SEQTK_BIN sample -s 42 "$FQ1" 5000000 > "${W_DIR}/work_space/sample_1.fastq"
+    $SEQTK_BIN sample -s 42 "$FQ2" 5000000 > "${W_DIR}/work_space/sample_2.fastq"
 
     PUSH_DIR=$(pwd)
     cd "${W_DIR}/work_space" || exit
 
-    # ARGs-OAP 自动读取当前目录 (./) 下的软链接 sample_1.fastq 和 sample_2.fastq
+    # ARGs-OAP 会自动读取当前目录 (./) 下的 sample_1.fastq 和 sample_2.fastq
     args_oap stage_one -i ./ -o ./result -f fastq -t "$THREADS"
     args_oap stage_two -i ./result -t "$THREADS" -o ./result
     
     if [[ -d "./result" ]]; then
         mv ./result/normalized_cell.*.txt ../
         cd "$PUSH_DIR" || exit
-        # 成功后删除 work_space (因为是软链接，不会删掉你真实的 clean.fastq)
-        rm -rf "${W_DIR}/work_space" 
+        rm -rf "${W_DIR}/work_space" # 成功后整个目录连带抽样的 fastq 一起删掉
         [[ -f "${PUSH_DIR}/fifo_map.mapout.txt" ]] && rm -f "${PUSH_DIR}/fifo_map.mapout.txt"
         touch "$LOG_DIR/${SAMPLE}.s5.done" ; timestamp_end
     else
@@ -451,38 +330,43 @@ if [[ "$RUN_STEP5_ARGS" == "true" ]] && [[ ! -f "$LOG_DIR/${SAMPLE}.s5.done" ]];
 fi
 
 # --- Step 6: inStrain (微多样性与群体遗传学全景分析) ---
-# 前提：依赖 Step 4.5 统一降采样后的 reads ($MAP_IN1 和 $MAP_IN2)
+# 前提：Step 2 fastp 已经修改为输出标准双端 reads ($OUT1 和 $OUT2)
 
-# 1. inStrain 数据库绝对路径定义
+# 1. inStrain 数据库绝对路径定义 (修改为新的 preterm_refseq_400 数据库)
 IS_DB_DIR="/data/wangjiaxuan/refer/preterm_refseq_400/preterm_refseq_400_v1"
 IS_FASTA="${IS_DB_DIR}/preterm_refseq_400.fasta"
-IS_BT2="${IS_DB_DIR}/preterm_refseq_400.fasta.bt2"
+IS_BT2="${IS_DB_DIR}/preterm_refseq_400.fasta.bt2" # Bowtie2 index 前缀 (完美兼容 .bt2l 大索引)
 IS_STB="${IS_DB_DIR}/preterm_refseq_400.stb"
 IS_GENES="${IS_DB_DIR}/preterm_refseq_400.genes.fna"
 
 if [[ "$RUN_STEP6_INSTRAIN" == "true" ]] && [[ ! -f "$LOG_DIR/${SAMPLE}.s6.done" ]]; then
     timestamp_start "inStrain"
     
-    # 定义输出路径
+    # 继承 Step 2 输出的双端 reads
+    OUT1="${CLEAN_DIR}/${SAMPLE}.clean_1.fastq"
+    OUT2="${CLEAN_DIR}/${SAMPLE}.clean_2.fastq"
+    
+    # 定义输出路径 (改名为 preterm400)
     BAM_OUT="${QUANT_DIR}/${SAMPLE}_preterm400.sorted.bam"
     IS_OUT_DIR="${QUANT_DIR}/${SAMPLE}_inStrain.IS"
 
     # 2. Bowtie2 高质量比对与 BAM 流水线处理
     if [[ ! -f "$BAM_OUT" ]]; then
         echo "[inStrain] Running Bowtie2 mapping to preterm_refseq_400 database..."
-        
-        # 终极提速：砍掉 samtools view，直连 sort，并分配 2G/线程 内存，彻底消灭硬盘 I/O 瓶颈！
-        bowtie2 -p "$THREADS" -x "$IS_BT2" -1 "$MAP_IN1" -2 "$MAP_IN2" --no-unal | \
-        samtools sort -@ "$THREADS" -m 2G -o "$BAM_OUT"
+        # 核心优化：--no-unal 不输出未比对上的 reads，大幅减小 BAM 文件体积
+        bowtie2 -p "$THREADS" -x "$IS_BT2" -1 "$OUT1" -2 "$OUT2" --no-unal | \
+        samtools view -bS - | \
+        samtools sort -@ "$THREADS" -o "$BAM_OUT"
         
         echo "[inStrain] Indexing BAM file..."
         samtools index -@ "$THREADS" "$BAM_OUT"
     fi
 
-    # 3. 运行 inStrain profile
+    # 3. 运行 inStrain profile (火力全开模式)
     if [[ -f "$BAM_OUT" ]]; then
         echo "[inStrain] Running inStrain profile with full parameters..."
         
+        # 挂载所有可用文件，开启 --database_mode 极速跳过未检出物种
         /data/wangjiaxuan/miniconda3/envs/meta1/bin/inStrain  \
         profile "$BAM_OUT" "$IS_FASTA" \
             -o "$IS_OUT_DIR" \
@@ -491,17 +375,19 @@ if [[ "$RUN_STEP6_INSTRAIN" == "true" ]] && [[ ! -f "$LOG_DIR/${SAMPLE}.s6.done"
             -s "$IS_STB" \
             --database_mode
         
-        # 4. 成功判定与日志瘦身
+        # 4. 成功判定
         if [[ -d "${IS_OUT_DIR}/output" ]]; then
             touch "$LOG_DIR/${SAMPLE}.s6.done"
             timestamp_end
             
+            # 5. inStrain 结果瘦身：删除无用的画图和臃肿的日志，保留 output 和 raw_data
             if [[ -d "${QUANT_DIR}/${SAMPLE}_inStrain.IS" ]]; then
-                echo "[inStrain] Cleaning up bloated logs and figures..."
+                echo "Cleaning up inStrain bloated logs and figures..."
                 rm -rf "${QUANT_DIR}/${SAMPLE}_inStrain.IS/figures"
                 rm -rf "${QUANT_DIR}/${SAMPLE}_inStrain.IS/log"
                 rm -f "$BAM_OUT" "${BAM_OUT}.bai"
             fi
+
         else
             echo "[ERROR] inStrain profile failed to generate output directory. Check logs."
             exit 1
@@ -514,7 +400,7 @@ fi
 
 
 # --- Step 7: SGVFinder2 (大片段结构变异与基因缺失分析) ---
-# 前提：同样依赖 Step 4.5 统一降采样后的 reads ($MAP_IN1 和 $MAP_IN2)
+# 前提：依赖 Step 2 的标准双端 reads ($OUT1 和 $OUT2)
 
 if [[ "$RUN_STEP7_SGVF" == "true" ]] && [[ ! -f "$LOG_DIR/${SAMPLE}.s7.done" ]]; then
     timestamp_start "SGVFinder2"
@@ -522,26 +408,34 @@ if [[ "$RUN_STEP7_SGVF" == "true" ]] && [[ ! -f "$LOG_DIR/${SAMPLE}.s7.done" ]];
     # 1. 绝对路径与环境定义
     ICRA_BIN="/data/wangjiaxuan/miniconda3/envs/sgvfinder/bin/icra"
     SVF_BIN="/data/wangjiaxuan/miniconda3/envs/sgvfinder/bin/svfinder"
+
+    # 【核心修改 1：完美的统一前缀】指向你刚刚建好的新目录和新前缀
     SGVF_DB_PREFIX="/data/wangjiaxuan/refer/preterm_refseq_400/sgvfinder/preterm_refseq_400_sgvfinder"
+
     SGVF_OUT_DIR="${QUANT_DIR}/${SAMPLE}_SGVF"
-    
     mkdir -p "$SGVF_OUT_DIR"
     
+    OUT1="${CLEAN_DIR}/${SAMPLE}.clean_1.fastq"
+    OUT2="${CLEAN_DIR}/${SAMPLE}.clean_2.fastq"
+
+    # 用 find 命令雷达扫描：检查是否已经跑完生成了 .jsdel 文件
     JSDEL_FILE=$(find "$SGVF_OUT_DIR" -maxdepth 1 -name "*.jsdel" | head -n 1)
 
-    # 2. 运行 ICRA：使用正确的长参数和抽样数据
+    # 2. 运行 ICRA：使用正确的长参数
     if [[ -z "$JSDEL_FILE" ]]; then
         echo "[SGVFinder2] Running ICRA (Iterative Coverage-based Read Assignment)..."
+        
+        # 【极其关键的防呆】：强制清理上次失败可能遗留的坏 bam，防止 icra 误判跳过比对！
         rm -f "$SGVF_OUT_DIR"/*.bam
         
-        # 【核心修改】：输入文件替换为 MAP_IN1 和 MAP_IN2
         $ICRA_BIN \
-            --fq1 "$MAP_IN1" \
-            --fq2 "$MAP_IN2" \
+            --fq1 "$OUT1" \
+            --fq2 "$OUT2" \
             --db "$SGVF_DB_PREFIX" \
             --outfol "$SGVF_OUT_DIR" \
             --threads "$THREADS"
             
+        # 跑完之后，再次扫描获取最新生成的 .jsdel 文件绝对路径
         JSDEL_FILE=$(find "$SGVF_OUT_DIR" -maxdepth 1 -name "*.jsdel" | head -n 1)
     fi
 
@@ -549,14 +443,18 @@ if [[ "$RUN_STEP7_SGVF" == "true" ]] && [[ ! -f "$LOG_DIR/${SAMPLE}.s7.done" ]];
     if [[ -n "$JSDEL_FILE" ]]; then
         echo "[SGVFinder2] Generating sample coverage map from: $(basename "$JSDEL_FILE")"
         
+        # 【核心修改 2】：--db_path 也必须使用带前缀的完整路径！
+        # 因为底层的 Python 逻辑是拿着这个前缀去贴 '.dlen' 后缀的
         $SVF_BIN get_sample_map --delta_file "$JSDEL_FILE" --db_path "$SGVF_DB_PREFIX"
         
+        # 显式捕获刚才那条命令的退出状态码
         if [[ $? -eq 0 ]]; then
+            # 状态码为 0，说明成功了！发通行证！
             touch "$LOG_DIR/${SAMPLE}.s7.done"
-            # 极速清理 SGVFinder2 产生的超大中间文件
             rm -f "$SGVF_OUT_DIR"/*.bam "$SGVF_OUT_DIR"/*.pmp "$SGVF_OUT_DIR"/*.jspi "$SGVF_OUT_DIR"/*.jsdel
             timestamp_end
         else
+            # 状态码非 0，说明报错了
             echo "[ERROR] SGVFinder2 get_sample_map failed. Check logs."
             exit 1
         fi
@@ -566,42 +464,26 @@ if [[ "$RUN_STEP7_SGVF" == "true" ]] && [[ ! -f "$LOG_DIR/${SAMPLE}.s7.done" ]];
     fi
 fi
 
-
 # --- Final Cleanup (动态感知全通过版) ---
 if [[ "$RUN_CLEANUP" == "true" ]]; then
     # 动态检查：默认可以清理。但只要有一个开启的模块没跑完，就不清理。
     CAN_CLEAN="true"
     [[ "$RUN_STEP3_MPA" == "true" && ! -f "$LOG_DIR/${SAMPLE}.s3.done" ]] && CAN_CLEAN="false"
-    
-    # 【修复】：补上 Step 3.5 的护城河，保护 SAM 文件！
-    [[ "$RUN_STEP35_STRAIN" == "true" && ! -f "$LOG_DIR/${SAMPLE}.s3_5.done" ]] && CAN_CLEAN="false"
-    
     [[ "$RUN_STEP4_HUMANN" == "true" && ! -f "$LOG_DIR/${SAMPLE}.s4.done" ]] && CAN_CLEAN="false"
     [[ "$RUN_STEP5_ARGS" == "true" && ! -f "$LOG_DIR/${SAMPLE}.s5.done" ]] && CAN_CLEAN="false"
     [[ "$RUN_STEP6_INSTRAIN" == "true" && ! -f "$LOG_DIR/${SAMPLE}.s6.done" ]] && CAN_CLEAN="false"
-    [[ "$RUN_STEP7_SGVF" == "true" && ! -f "$LOG_DIR/${SAMPLE}.s7.done" ]] && CAN_CLEAN="false" 
+    [[ "$RUN_STEP7_SGVF" == "true" && ! -f "$LOG_DIR/${SAMPLE}.s7.done" ]] && CAN_CLEAN="false" # <-- 新增这一行
 
     if [[ "$CAN_CLEAN" == "true" ]]; then
-
-        # --- (之前保留的清理代码) ---
         echo "[$(get_time)] >>> ALL TARGET STEPS SUCCESSFUL: $SAMPLE. Starting cleanup."
+        # 1. 恢复：删除占用空间巨大的 SAM 临时文件 (MetaPhlAn 产生的)
         [[ -f "${QUANT_DIR}/${SAMPLE}.sam.bz2" ]] && rm -f "${QUANT_DIR}/${SAMPLE}.sam.bz2"
 
+        # 2. 删除拼接版的 clean.fastq 以释放空间
         if [[ -f "${CLEAN_DIR}/${SAMPLE}.clean.fastq" ]]; then
             rm -f "${CLEAN_DIR}/${SAMPLE}.clean.fastq"
         fi
 
-        # ==========================================================
-        # 【新增】：彻底销毁统一降采样产生的 sub.fastq，释放宝贵硬盘空间
-        # ==========================================================
-        SUB_R1="${CLEAN_DIR}/${SAMPLE}.sub_1.fastq"
-        SUB_R2="${CLEAN_DIR}/${SAMPLE}.sub_2.fastq"
-        if [[ -f "$SUB_R1" ]]; then
-            echo "[Cleanup] Removing subsampled temporary fastq files..."
-            rm -f "$SUB_R1" "$SUB_R2"
-        fi
-        
-        # --- (后续的 pigz 压缩逻辑保留) ---
         # 3. 压缩双端 clean data 留档 (pigz 压缩后会自动删除原文件)
         for fq in "${CLEAN_DIR}/${SAMPLE}.clean_1.fastq" "${CLEAN_DIR}/${SAMPLE}.clean_2.fastq"; do
             if [[ -f "$fq" ]]; then
