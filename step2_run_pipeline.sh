@@ -19,8 +19,11 @@ echo "------------------------------------------------"
 # --joblog: 极其重要！记录每个样本的退出状态
 # --resume: 如果任务中断，下次运行会自动跳过已完成的样本
 # --progress: 实时显示进度条和预计完成时间 (ETA)
+# --timeout 18h: 保证时间不能超过8h
+
 cat "$META_FILE" | /data/wangjiaxuan/miniconda3/envs/meta/bin/parallel \
     -j "$MAX_JOBS" \
+    --timeout 18h \
     --colsep '\t' \
     --joblog "$JOBLOG" \
     --progress \
