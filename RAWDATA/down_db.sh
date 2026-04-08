@@ -7,7 +7,7 @@ SLEEP_TIME=10
 while [ $COUNT -lt $MAX_RETRIES ]; do
     echo "开始/恢复下载任务 (第 $((COUNT+1)) 次尝试)..."
     
-    /data/wangjiaxuan/miniforge3/bin/iseq -i retry.sra -g -p 4 -t 4
+    /data/wangjiaxuan/miniforge3/bin/iseq -i sra -g -p 4 -t 4
     
     if [ $? -eq 0 ]; then
         echo "🎉 所有 SRA 数据下载完成！"

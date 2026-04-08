@@ -26,7 +26,6 @@ cat "$META_FILE" | /data/wangjiaxuan/miniconda3/envs/meta/bin/parallel \
     --timeout 18h \
     --colsep '\t' \
     --joblog "$JOBLOG" \
-    --progress \
     "bash single_sample_process.sh {1} {2} {3} $THREADS_PER_JOB"
 
 # 任务收尾统计
